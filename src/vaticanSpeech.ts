@@ -1,122 +1,215 @@
 /**
  * Cliente + parser para el endpoint JSON "no oficial" de Vatican News:
- *   https://www.vaticannews.va/es/evangelio-de-hoy/YYYY/MM/DD.speech.js
+ *   ES: https://www.vaticannews.va/es/evangelio-de-hoy/YYYY/MM/DD.speech.js
+ *   EN: https://www.vaticannews.va/en/word-of-the-day/YYYY/MM/DD.speech.js
  *
- * Este endpoint devuelve JSON puro (usado internamente por el sitio para
- * el texto-a-voz), con:
- *   - letturaText: HTML con primera lectura y (domingos/solemnidades) segunda
- *   - vangeloText: HTML con el evangelio
- *   - hfwText: HTML con la reflexión/catequesis papal
+ * Ambos devuelven la misma forma de JSON (letturaText, vangeloText, hfwText),
+ * pero con maquetación distinta dentro del HTML:
  *
- * NOTA: el salmo responsorial NO viene en este endpoint tampoco.
- * Lo verifiqué con el domingo 12/07/2026 (que sí trae segunda lectura) y
- * sigue sin aparecer el salmo en ningún campo.
+ *  - ES: "Primera lectura" / "Segunda lectura" como <p> propio, luego
+ *        "Lectura del libro de..." en otro <p>, luego la cita en otro <p>.
+ *  - EN: sin label de "First/Second reading"; el libro y la cita vienen
+ *        juntos en el mismo <p>, separados por <br> (ej: "A reading from
+ *        the Book of Isaiah<br/>55:10-11").
  *
- * Escrito para funcionar tanto en Node.js como en Cloudflare Workers
+ * NOTA: el salmo responsorial NO viene en ningún idioma de este endpoint.
+ * Verificado en ES y EN para domingos (con segunda lectura) y no aparece
+ * en ningún campo.
+ *
+ * Pensado para correr tanto en Node.js como en Cloudflare Workers
  * (usa fetch nativo, sin axios).
  */
 
 import * as cheerio from "cheerio";
 
-const BASE_URL = "https://www.vaticannews.va/es/evangelio-de-hoy";
+export type Locale = "es" | "en";
 
-function pad(n: string | number) {
+export interface ReadingSection {
+  etiqueta: string | null;
+  libro: string | null;
+  cita: string | null;
+  texto: string[];
+}
+
+export interface VaticanReadings {
+  fecha: string;
+  locale: Locale;
+  url: string;
+  primeraLectura: ReadingSection | null;
+  salmo: null;
+  segundaLectura: ReadingSection | null;
+  evangelio: ReadingSection | null;
+  reflexionPapal: string | null;
+}
+
+interface SpeechResponse {
+  speech?: Array<{
+    letturaText?: string;
+    vangeloText?: string;
+    hfwText?: string;
+  }>;
+}
+
+interface LocaleConfig {
+  baseUrl: string;
+  /** Etiqueta de sección como párrafo propio (solo ES). null si el idioma no la trae. */
+  labelRegex: RegExp | null;
+  /** Detecta el párrafo que introduce una lectura o el evangelio. */
+  introRegex: RegExp;
+  /** Etiquetas por defecto si el idioma no las trae explícitas (ej. EN). */
+  defaultLabels: [string, string];
+}
+
+const LOCALES: Record<Locale, LocaleConfig> = {
+  es: {
+    baseUrl: "https://www.vaticannews.va/es/evangelio-de-hoy",
+    labelRegex: /^(Primera|Segunda) lectura$/i,
+    introRegex: /^Lectura (del|de la)/i,
+    defaultLabels: ["Primera lectura", "Segunda lectura"],
+  },
+  en: {
+    baseUrl: "https://www.vaticannews.va/en/word-of-the-day",
+    labelRegex: null,
+    introRegex: /^(A reading from|From the Gospel according to)/i,
+    defaultLabels: ["First reading", "Second reading"],
+  },
+};
+
+function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-export function buildSpeechUrl(date = new Date()) {
-  const yyyy = date.getFullYear();
+export function buildSpeechUrl(
+  locale: Locale,
+  date: Date = new Date(),
+): { url: string; yyyy: string; mm: string; dd: string } {
+  const cfg = LOCALES[locale];
+  const yyyy = String(date.getFullYear());
   const mm = pad(date.getMonth() + 1);
   const dd = pad(date.getDate());
-  return { url: `${BASE_URL}/${yyyy}/${mm}/${dd}.speech.js`, yyyy, mm, dd };
+  return { url: `${cfg.baseUrl}/${yyyy}/${mm}/${dd}.speech.js`, yyyy, mm, dd };
+}
+
+/** Convierte HTML a texto plano, preservando <br> como salto de línea y normalizando &nbsp;. */
+function htmlToPlain(html: string): string {
+  const withBreaks = html.replace(/<br\s*\/?>/gi, "\n");
+  const $ = cheerio.load(`<div>${withBreaks}</div>`);
+  return $("div")
+    .text()
+    .replace(/\u00A0/g, " ")
+    .trim();
+}
+
+/** Aplica un formateo ligero (negrita/cursiva -> markdown) y limpia el HTML. */
+function htmlToFormattedPlain(html: string): string {
+  const withMarkers = html
+    .replace(/<i>(.*?)<\/i>/gis, "_$1_")
+    .replace(/<b>(.*?)<\/b>/gis, "**$1**")
+    .replace(/<strong>(.*?)<\/strong>/gis, "**$1**")
+    .replace(/<br\s*\/?>/gi, "\n");
+  return htmlToPlain(withMarkers);
+}
+
+/** Heurística: ¿esta línea corta parece una cita bíblica (y no un libro o cuerpo)? */
+function looksLikeCitation(line: string): boolean {
+  if (line.length >= 40) return false;
+  const bareNumeric = /^\d+[:,]\s*\d/; // "55:10-11"
+  const withBookName = /^[A-ZÀ-ÿ][\wÀ-ÿ]*\s.*\d/; // "Isaías 55, 10-11" / "Romans 8:18-23"
+  return bareNumeric.test(line) || withBookName.test(line);
 }
 
 /**
- * Recorre los <p> de un fragmento HTML y los agrupa en "lecturas".
- * Cada vez que encuentra un <p> que coincide con un label conocido
- * ("Primera lectura" / "Segunda lectura") abre una lectura nueva.
- * Si el fragmento no trae label (como vangeloText), todo se trata
- * como una sola lectura.
+ * Parsea un fragmento HTML (letturaText o vangeloText) en una o más
+ * "lecturas", detectando límites de sección tanto por etiqueta explícita
+ * (ES) como por el inicio de un nuevo párrafo introductorio (EN).
  */
-function parseReadingsHtml(
-  $: cheerio.CheerioAPI,
-  html: string,
-  labelRegex: RegExp | null,
-) {
-  const $frag = $("<div>").html(html);
-  const paragraphs = $frag
+function parseSections(html: string, cfg: LocaleConfig): ReadingSection[] {
+  const $ = cheerio.load(`<div>${html}</div>`);
+  const rawParagraphs = $("div")
     .find("p")
-    .map((_, el) => $(el).html()?.trim())
-    .get()
-    .filter(Boolean);
+    .map((_, el) => $.html(el).replace(/^<p[^>]*>|<\/p>$/gi, ""))
+    .get();
 
-  const readings: Array<{
-    etiqueta: string | null;
-    libro: string | null;
-    cita: string | null;
-    texto: string[];
-  }> = [];
-  let current: {
-    etiqueta: string | null;
-    libro: string | null;
-    cita: string | null;
-    texto: string[];
-  } | null = null;
+  const sections: ReadingSection[] = [];
+  let current: ReadingSection | null = null;
 
-  for (const raw of paragraphs) {
-    // Texto plano (sin tags) para detectar labels y encabezados cortos
-    const plain = cheerio.load(`<div>${raw}</div>`)("div").text().trim();
+  for (const raw of rawParagraphs) {
+    const plain = htmlToPlain(raw);
+    if (!plain) continue; // párrafos vacíos tipo "&nbsp;" separan secciones
 
-    if (labelRegex && labelRegex.test(plain) && plain.length < 40) {
+    // 1. Etiqueta de sección explícita (solo ES: "Primera lectura", etc.)
+    if (cfg.labelRegex && cfg.labelRegex.test(plain) && plain.length < 40) {
       current = { etiqueta: plain, libro: null, cita: null, texto: [] };
-      readings.push(current);
+      sections.push(current);
       continue;
     }
 
+    const lines = plain
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    // 2. Párrafo introductorio de lectura/evangelio
+    if (lines.length > 0 && cfg.introRegex.test(lines[0])) {
+      const needsNewSection =
+        !current || current.texto.length > 0 || current.libro;
+      if (needsNewSection) {
+        current = { etiqueta: null, libro: null, cita: null, texto: [] };
+        sections.push(current);
+      }
+      current!.libro = lines[0];
+      if (lines.length > 1 && looksLikeCitation(lines[1])) {
+        current!.cita = lines[1];
+      }
+      continue;
+    }
+
+    // 3. Cita en párrafo separado (patrón ES cuando no viene junto al libro)
+    if (
+      current &&
+      current.libro &&
+      !current.cita &&
+      lines.length === 1 &&
+      looksLikeCitation(lines[0])
+    ) {
+      current.cita = lines[0];
+      continue;
+    }
+
+    // 4. Cuerpo del texto
     if (!current) {
       current = { etiqueta: null, libro: null, cita: null, texto: [] };
-      readings.push(current);
+      sections.push(current);
     }
-
-    if (!current.libro && /^Lectura (del|de la)/i.test(plain)) {
-      current.libro = plain;
-      continue;
-    }
-
-    if (
-      !current.cita &&
-      current.libro &&
-      plain.length < 40 &&
-      /\d/.test(plain)
-    ) {
-      current.cita = plain;
-      continue;
-    }
-
-    // Preservamos negritas/cursivas simples como markdown ligero
-    const conFormato = raw
-      .replace(/<i>(.*?)<\/i>/gi, "_$1_")
-      .replace(/<b>(.*?)<\/b>/gi, "**$1**")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .trim();
-    const textoPlano = cheerio
-      .load(`<div>${conFormato}</div>`)("div")
-      .text()
-      .trim();
-
-    if (textoPlano) current.texto.push(textoPlano);
+    const formatted = htmlToFormattedPlain(raw);
+    if (formatted) current.texto.push(formatted);
   }
 
-  return readings;
+  return sections;
+}
+
+/** Aplica etiquetas por defecto ("First reading"/"Second reading") solo a las lecturas, nunca al evangelio. */
+function applyDefaultLabels(
+  sections: ReadingSection[],
+  cfg: LocaleConfig,
+): void {
+  sections.forEach((s, i) => {
+    if (!s.etiqueta && cfg.defaultLabels[i]) {
+      s.etiqueta = cfg.defaultLabels[i];
+    }
+  });
 }
 
 /**
- * Obtiene y parsea las lecturas del día indicado (por defecto, hoy).
- * @param {Date} date
- * @returns {Promise<object>}
+ * Obtiene y parsea las lecturas del día indicado (por defecto, hoy) en el
+ * idioma indicado (por defecto, español).
  */
-export async function getVaticanReadings(date = new Date()) {
-  const { url, yyyy, mm, dd } = buildSpeechUrl(date);
+export async function getVaticanReadings(
+  date: Date = new Date(),
+  locale: Locale = "es",
+): Promise<VaticanReadings> {
+  const cfg = LOCALES[locale];
+  const { url, yyyy, mm, dd } = buildSpeechUrl(locale, date);
 
   const res = await fetch(url, {
     headers: {
@@ -130,33 +223,29 @@ export async function getVaticanReadings(date = new Date()) {
     throw new Error(`Vatican News respondió ${res.status} para ${url}`);
   }
 
-  const data = await res.json();
+  const data = (await res.json()) as SpeechResponse;
   const item = data?.speech?.[0];
 
   if (!item) {
     throw new Error("Respuesta inesperada: no se encontró data.speech[0]");
   }
 
-  const $ = cheerio.load("<div></div>");
-
-  const lecturas = parseReadingsHtml(
-    $,
-    item.letturaText || "",
-    /^(Primera|Segunda) lectura$/i,
-  );
+  const lecturas = parseSections(item.letturaText ?? "", cfg);
+  applyDefaultLabels(lecturas, cfg);
   const [primeraLectura = null, segundaLectura = null] = lecturas;
 
-  const evangelioArr = parseReadingsHtml($, item.vangeloText || "", null);
-  const evangelio = evangelioArr[0] || null;
+  const evangelioArr = parseSections(item.vangeloText ?? "", cfg);
+  const evangelio = evangelioArr[0] ?? null;
+  if (evangelio) evangelio.etiqueta = null; // el campo "evangelio" ya es autodescriptivo
 
-  const $reflexion = cheerio.load(`<div>${item.hfwText || ""}</div>`);
-  const reflexionPapal = $reflexion("div").text().trim() || null;
+  const reflexionPapal = htmlToFormattedPlain(item.hfwText ?? "") || null;
 
   return {
     fecha: `${yyyy}-${mm}-${dd}`,
+    locale,
     url,
     primeraLectura,
-    salmo: null, // No publicado por Vatican News en ningún endpoint conocido
+    salmo: null, // No publicado por Vatican News en ningún idioma/endpoint conocido
     segundaLectura,
     evangelio,
     reflexionPapal,
